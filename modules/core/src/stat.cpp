@@ -12,6 +12,7 @@
 //
 // Copyright (C) 2000-2008, Intel Corporation, all rights reserved.
 // Copyright (C) 2009-2011, Willow Garage Inc., all rights reserved.
+// Copyright (C) 2014-2015, Itseez Inc., all rights reserved.
 // Third party copyrights are property of their respective owners.
 //
 // Redistribution and use in source and binary forms, with or without modification,
@@ -72,7 +73,114 @@ struct Sum_SIMD
     }
 };
 
-#if CV_NEON
+#if CV_SSE2
+
+template <>
+struct Sum_SIMD<schar, int>
+{
+    int operator () (const schar * src0, const uchar * mask, int * dst, int len, int cn) const
+    {
+        if (mask || (cn != 1 && cn != 2 && cn != 4) || !USE_SSE2)
+            return 0;
+
+        int x = 0;
+        __m128i v_zero = _mm_setzero_si128(), v_sum = v_zero;
+
+        for ( ; x <= len - 16; x += 16)
+        {
+            __m128i v_src = _mm_loadu_si128((const __m128i *)(src0 + x));
+            __m128i v_half = _mm_srai_epi16(_mm_unpacklo_epi8(v_zero, v_src), 8);
+
+            v_sum = _mm_add_epi32(v_sum, _mm_srai_epi32(_mm_unpacklo_epi16(v_zero, v_half), 16));
+            v_sum = _mm_add_epi32(v_sum, _mm_srai_epi32(_mm_unpackhi_epi16(v_zero, v_half), 16));
+
+            v_half = _mm_srai_epi16(_mm_unpackhi_epi8(v_zero, v_src), 8);
+            v_sum = _mm_add_epi32(v_sum, _mm_srai_epi32(_mm_unpacklo_epi16(v_zero, v_half), 16));
+            v_sum = _mm_add_epi32(v_sum, _mm_srai_epi32(_mm_unpackhi_epi16(v_zero, v_half), 16));
+        }
+
+        for ( ; x <= len - 8; x += 8)
+        {
+            __m128i v_src = _mm_srai_epi16(_mm_unpacklo_epi8(v_zero, _mm_loadl_epi64((__m128i const *)(src0 + x))), 8);
+
+            v_sum = _mm_add_epi32(v_sum, _mm_srai_epi32(_mm_unpacklo_epi16(v_zero, v_src), 16));
+            v_sum = _mm_add_epi32(v_sum, _mm_srai_epi32(_mm_unpackhi_epi16(v_zero, v_src), 16));
+        }
+
+        int CV_DECL_ALIGNED(16) ar[4];
+        _mm_store_si128((__m128i*)ar, v_sum);
+
+        for (int i = 0; i < 4; i += cn)
+            for (int j = 0; j < cn; ++j)
+                dst[j] += ar[j + i];
+
+        return x / cn;
+    }
+};
+
+template <>
+struct Sum_SIMD<int, double>
+{
+    int operator () (const int * src0, const uchar * mask, double * dst, int len, int cn) const
+    {
+        if (mask || (cn != 1 && cn != 2 && cn != 4) || !USE_SSE2)
+            return 0;
+
+        int x = 0;
+        __m128d v_zero = _mm_setzero_pd(), v_sum0 = v_zero, v_sum1 = v_zero;
+
+        for ( ; x <= len - 4; x += 4)
+        {
+            __m128i v_src = _mm_loadu_si128((__m128i const *)(src0 + x));
+            v_sum0 = _mm_add_pd(v_sum0, _mm_cvtepi32_pd(v_src));
+            v_sum1 = _mm_add_pd(v_sum1, _mm_cvtepi32_pd(_mm_srli_si128(v_src, 8)));
+        }
+
+        double CV_DECL_ALIGNED(16) ar[4];
+        _mm_store_pd(ar, v_sum0);
+        _mm_store_pd(ar + 2, v_sum1);
+
+        for (int i = 0; i < 4; i += cn)
+            for (int j = 0; j < cn; ++j)
+                dst[j] += ar[j + i];
+
+        return x / cn;
+    }
+};
+
+template <>
+struct Sum_SIMD<float, double>
+{
+    int operator () (const float * src0, const uchar * mask, double * dst, int len, int cn) const
+    {
+        if (mask || (cn != 1 && cn != 2 && cn != 4) || !USE_SSE2)
+            return 0;
+
+        int x = 0;
+        __m128d v_zero = _mm_setzero_pd(), v_sum0 = v_zero, v_sum1 = v_zero;
+
+        for ( ; x <= len - 4; x += 4)
+        {
+            __m128 v_src = _mm_loadu_ps(src0 + x);
+            v_sum0 = _mm_add_pd(v_sum0, _mm_cvtps_pd(v_src));
+            v_src = _mm_castsi128_ps(_mm_srli_si128(_mm_castps_si128(v_src), 8));
+            v_sum1 = _mm_add_pd(v_sum1, _mm_cvtps_pd(v_src));
+        }
+
+        double CV_DECL_ALIGNED(16) ar[4];
+        _mm_store_pd(ar, v_sum0);
+        _mm_store_pd(ar + 2, v_sum1);
+
+        for (int i = 0; i < 4; i += cn)
+            for (int j = 0; j < cn; ++j)
+                dst[j] += ar[j + i];
+
+        return x / cn;
+    }
+};
+
+
+#elif CV_NEON
 
 template <>
 struct Sum_SIMD<uchar, int>
@@ -396,6 +504,39 @@ static int countNonZero_(const T* src, int len )
     return nz;
 }
 
+#if CV_SSE2
+
+static const uchar * initPopcountTable()
+{
+    static uchar tab[256];
+    static volatile bool initialized = false;
+    if( !initialized )
+    {
+        // we compute inverse popcount table,
+        // since we pass (img[x] == 0) mask as index in the table.
+        unsigned int j = 0u;
+#if CV_POPCNT
+        if (checkHardwareSupport(CV_CPU_POPCNT))
+        {
+            for( ; j < 256u; j++ )
+                tab[j] = (uchar)(8 - _mm_popcnt_u32(j));
+        }
+#endif
+        for( ; j < 256u; j++ )
+        {
+            int val = 0;
+            for( int mask = 1; mask < 256; mask += mask )
+                val += (j & mask) == 0;
+            tab[j] = (uchar)val;
+        }
+        initialized = true;
+    }
+
+    return tab;
+}
+
+#endif
+
 static int countNonZero8u( const uchar* src, int len )
 {
     int i=0, nz = 0;
@@ -403,21 +544,7 @@ static int countNonZero8u( const uchar* src, int len )
     if(USE_SSE2)//5x-6x
     {
         __m128i pattern = _mm_setzero_si128 ();
-        static uchar tab[256];
-        static volatile bool initialized = false;
-        if( !initialized )
-        {
-            // we compute inverse popcount table,
-            // since we pass (img[x] == 0) mask as index in the table.
-            for( int j = 0; j < 256; j++ )
-            {
-                int val = 0;
-                for( int mask = 1; mask < 256; mask += mask )
-                    val += (j & mask) == 0;
-                tab[j] = (uchar)val;
-            }
-            initialized = true;
-        }
+        static const uchar * tab = initPopcountTable();
 
         for (; i<=len-16; i+=16)
         {
@@ -467,7 +594,22 @@ static int countNonZero8u( const uchar* src, int len )
 static int countNonZero16u( const ushort* src, int len )
 {
     int i = 0, nz = 0;
-#if CV_NEON
+#if CV_SSE2
+    if (USE_SSE2)
+    {
+        __m128i v_zero = _mm_setzero_si128 ();
+        static const uchar * tab = initPopcountTable();
+
+        for ( ; i <= len - 8; i += 8)
+        {
+            __m128i v_src = _mm_loadu_si128((const __m128i*)(src + i));
+            int val = _mm_movemask_epi8(_mm_packs_epi16(_mm_cmpeq_epi16(v_src, v_zero), v_zero));
+            nz += tab[val];
+        }
+
+        src += i;
+    }
+#elif CV_NEON
     int len0 = len & -8, blockSize1 = (1 << 15), blockSize0 = blockSize1 << 6;
     uint32x4_t v_nz = vdupq_n_u32(0u);
     uint16x8_t v_zero = vdupq_n_u16(0), v_1 = vdupq_n_u16(1);
@@ -503,7 +645,27 @@ static int countNonZero16u( const ushort* src, int len )
 static int countNonZero32s( const int* src, int len )
 {
     int i = 0, nz = 0;
-#if CV_NEON
+#if CV_SSE2
+    if (USE_SSE2)
+    {
+        __m128i v_zero = _mm_setzero_si128 ();
+        static const uchar * tab = initPopcountTable();
+
+        for ( ; i <= len - 8; i += 8)
+        {
+            __m128i v_src = _mm_loadu_si128((const __m128i*)(src + i));
+            __m128i v_dst0 = _mm_cmpeq_epi32(v_src, v_zero);
+
+            v_src = _mm_loadu_si128((const __m128i*)(src + i + 4));
+            __m128i v_dst1 = _mm_cmpeq_epi32(v_src, v_zero);
+
+            int val = _mm_movemask_epi8(_mm_packs_epi16(_mm_packs_epi32(v_dst0, v_dst1), v_zero));
+            nz += tab[val];
+        }
+
+        src += i;
+    }
+#elif CV_NEON
     int len0 = len & -8, blockSize1 = (1 << 15), blockSize0 = blockSize1 << 6;
     uint32x4_t v_nz = vdupq_n_u32(0u);
     int32x4_t v_zero = vdupq_n_s32(0.0f);
@@ -541,7 +703,25 @@ static int countNonZero32s( const int* src, int len )
 static int countNonZero32f( const float* src, int len )
 {
     int i = 0, nz = 0;
-#if CV_NEON
+#if CV_SSE2
+    if (USE_SSE2)
+    {
+        __m128i v_zero_i = _mm_setzero_si128();
+        __m128 v_zero_f = _mm_setzero_ps();
+        static const uchar * tab = initPopcountTable();
+
+        for ( ; i <= len - 8; i += 8)
+        {
+            __m128i v_dst0 = _mm_castps_si128(_mm_cmpeq_ps(_mm_loadu_ps(src + i), v_zero_f));
+            __m128i v_dst1 = _mm_castps_si128(_mm_cmpeq_ps(_mm_loadu_ps(src + i + 4), v_zero_f));
+
+            int val = _mm_movemask_epi8(_mm_packs_epi16(_mm_packs_epi32(v_dst0, v_dst1), v_zero_i));
+            nz += tab[val];
+        }
+
+        src += i;
+    }
+#elif CV_NEON
     int len0 = len & -8, blockSize1 = (1 << 15), blockSize0 = blockSize1 << 6;
     uint32x4_t v_nz = vdupq_n_u32(0u);
     float32x4_t v_zero = vdupq_n_f32(0.0f);
@@ -577,7 +757,34 @@ static int countNonZero32f( const float* src, int len )
 }
 
 static int countNonZero64f( const double* src, int len )
-{ return countNonZero_(src, len); }
+{
+    int i = 0, nz = 0;
+#if CV_SSE2
+    if (USE_SSE2)
+    {
+        __m128i v_zero_i = _mm_setzero_si128();
+        __m128d v_zero_d = _mm_setzero_pd();
+        static const uchar * tab = initPopcountTable();
+
+        for ( ; i <= len - 8; i += 8)
+        {
+            __m128i v_dst0 = _mm_castpd_si128(_mm_cmpeq_pd(_mm_loadu_pd(src + i), v_zero_d));
+            __m128i v_dst1 = _mm_castpd_si128(_mm_cmpeq_pd(_mm_loadu_pd(src + i + 2), v_zero_d));
+            __m128i v_dst2 = _mm_castpd_si128(_mm_cmpeq_pd(_mm_loadu_pd(src + i + 4), v_zero_d));
+            __m128i v_dst3 = _mm_castpd_si128(_mm_cmpeq_pd(_mm_loadu_pd(src + i + 6), v_zero_d));
+
+            v_dst0 = _mm_packs_epi32(v_dst0, v_dst1);
+            v_dst1 = _mm_packs_epi32(v_dst2, v_dst3);
+
+            int val = _mm_movemask_epi8(_mm_packs_epi16(_mm_packs_epi32(v_dst0, v_dst1), v_zero_i));
+            nz += tab[val];
+        }
+
+        src += i;
+    }
+#endif
+    return nz + countNonZero_(src, len - i);
+}
 
 typedef int (*CountNonZeroFunc)(const uchar*, int);
 
@@ -594,6 +801,137 @@ static CountNonZeroFunc getCountNonZeroTab(int depth)
     return countNonZeroTab[depth];
 }
 
+template <typename T, typename ST, typename SQT>
+struct SumSqr_SIMD
+{
+    int operator () (const T *, const uchar *, ST *, SQT *, int, int) const
+    {
+        return 0;
+    }
+};
+
+#if CV_SSE2
+
+template <>
+struct SumSqr_SIMD<uchar, int, int>
+{
+    int operator () (const uchar * src0, const uchar * mask, int * sum, int * sqsum, int len, int cn) const
+    {
+        if (mask || (cn != 1 && cn != 2) || !USE_SSE2)
+            return 0;
+
+        int x = 0;
+        __m128i v_zero = _mm_setzero_si128(), v_sum = v_zero, v_sqsum = v_zero;
+
+        for ( ; x <= len - 16; x += 16)
+        {
+            __m128i v_src = _mm_loadu_si128((const __m128i *)(src0 + x));
+            __m128i v_half = _mm_unpacklo_epi8(v_src, v_zero);
+
+            __m128i v_mullo = _mm_mullo_epi16(v_half, v_half);
+            __m128i v_mulhi = _mm_mulhi_epi16(v_half, v_half);
+            v_sum = _mm_add_epi32(v_sum, _mm_unpacklo_epi16(v_half, v_zero));
+            v_sum = _mm_add_epi32(v_sum, _mm_unpackhi_epi16(v_half, v_zero));
+            v_sqsum = _mm_add_epi32(v_sqsum, _mm_unpacklo_epi16(v_mullo, v_mulhi));
+            v_sqsum = _mm_add_epi32(v_sqsum, _mm_unpackhi_epi16(v_mullo, v_mulhi));
+
+            v_half = _mm_unpackhi_epi8(v_src, v_zero);
+            v_mullo = _mm_mullo_epi16(v_half, v_half);
+            v_mulhi = _mm_mulhi_epi16(v_half, v_half);
+            v_sum = _mm_add_epi32(v_sum, _mm_unpacklo_epi16(v_half, v_zero));
+            v_sum = _mm_add_epi32(v_sum, _mm_unpackhi_epi16(v_half, v_zero));
+            v_sqsum = _mm_add_epi32(v_sqsum, _mm_unpacklo_epi16(v_mullo, v_mulhi));
+            v_sqsum = _mm_add_epi32(v_sqsum, _mm_unpackhi_epi16(v_mullo, v_mulhi));
+        }
+
+        for ( ; x <= len - 8; x += 8)
+        {
+            __m128i v_src = _mm_unpacklo_epi8(_mm_loadl_epi64((__m128i const *)(src0 + x)), v_zero);
+
+            __m128i v_mullo = _mm_mullo_epi16(v_src, v_src);
+            __m128i v_mulhi = _mm_mulhi_epi16(v_src, v_src);
+            v_sum = _mm_add_epi32(v_sum, _mm_unpacklo_epi16(v_src, v_zero));
+            v_sum = _mm_add_epi32(v_sum, _mm_unpackhi_epi16(v_src, v_zero));
+            v_sqsum = _mm_add_epi32(v_sqsum, _mm_unpacklo_epi16(v_mullo, v_mulhi));
+            v_sqsum = _mm_add_epi32(v_sqsum, _mm_unpackhi_epi16(v_mullo, v_mulhi));
+        }
+
+        int CV_DECL_ALIGNED(16) ar[8];
+        _mm_store_si128((__m128i*)ar, v_sum);
+        _mm_store_si128((__m128i*)(ar + 4), v_sqsum);
+
+        for (int i = 0; i < 4; i += cn)
+            for (int j = 0; j < cn; ++j)
+            {
+                sum[j] += ar[j + i];
+                sqsum[j] += ar[4 + j + i];
+            }
+
+        return x / cn;
+    }
+};
+
+template <>
+struct SumSqr_SIMD<schar, int, int>
+{
+    int operator () (const schar * src0, const uchar * mask, int * sum, int * sqsum, int len, int cn) const
+    {
+        if (mask || (cn != 1 && cn != 2) || !USE_SSE2)
+            return 0;
+
+        int x = 0;
+        __m128i v_zero = _mm_setzero_si128(), v_sum = v_zero, v_sqsum = v_zero;
+
+        for ( ; x <= len - 16; x += 16)
+        {
+            __m128i v_src = _mm_loadu_si128((const __m128i *)(src0 + x));
+            __m128i v_half = _mm_srai_epi16(_mm_unpacklo_epi8(v_zero, v_src), 8);
+
+            __m128i v_mullo = _mm_mullo_epi16(v_half, v_half);
+            __m128i v_mulhi = _mm_mulhi_epi16(v_half, v_half);
+            v_sum = _mm_add_epi32(v_sum, _mm_srai_epi32(_mm_unpacklo_epi16(v_zero, v_half), 16));
+            v_sum = _mm_add_epi32(v_sum, _mm_srai_epi32(_mm_unpackhi_epi16(v_zero, v_half), 16));
+            v_sqsum = _mm_add_epi32(v_sqsum, _mm_unpacklo_epi16(v_mullo, v_mulhi));
+            v_sqsum = _mm_add_epi32(v_sqsum, _mm_unpackhi_epi16(v_mullo, v_mulhi));
+
+            v_half = _mm_srai_epi16(_mm_unpackhi_epi8(v_zero, v_src), 8);
+            v_mullo = _mm_mullo_epi16(v_half, v_half);
+            v_mulhi = _mm_mulhi_epi16(v_half, v_half);
+            v_sum = _mm_add_epi32(v_sum, _mm_srai_epi32(_mm_unpacklo_epi16(v_zero, v_half), 16));
+            v_sum = _mm_add_epi32(v_sum, _mm_srai_epi32(_mm_unpackhi_epi16(v_zero, v_half), 16));
+            v_sqsum = _mm_add_epi32(v_sqsum, _mm_unpacklo_epi16(v_mullo, v_mulhi));
+            v_sqsum = _mm_add_epi32(v_sqsum, _mm_unpackhi_epi16(v_mullo, v_mulhi));
+        }
+
+        for ( ; x <= len - 8; x += 8)
+        {
+            __m128i v_src = _mm_srai_epi16(_mm_unpacklo_epi8(v_zero, _mm_loadl_epi64((__m128i const *)(src0 + x))), 8);
+
+            __m128i v_mullo = _mm_mullo_epi16(v_src, v_src);
+            __m128i v_mulhi = _mm_mulhi_epi16(v_src, v_src);
+            v_sum = _mm_add_epi32(v_sum, _mm_srai_epi32(_mm_unpacklo_epi16(v_zero, v_src), 16));
+            v_sum = _mm_add_epi32(v_sum, _mm_srai_epi32(_mm_unpackhi_epi16(v_zero, v_src), 16));
+            v_sqsum = _mm_add_epi32(v_sqsum, _mm_unpacklo_epi16(v_mullo, v_mulhi));
+            v_sqsum = _mm_add_epi32(v_sqsum, _mm_unpackhi_epi16(v_mullo, v_mulhi));
+        }
+
+        int CV_DECL_ALIGNED(16) ar[8];
+        _mm_store_si128((__m128i*)ar, v_sum);
+        _mm_store_si128((__m128i*)(ar + 4), v_sqsum);
+
+        for (int i = 0; i < 4; i += cn)
+            for (int j = 0; j < cn; ++j)
+            {
+                sum[j] += ar[j + i];
+                sqsum[j] += ar[4 + j + i];
+            }
+
+        return x / cn;
+    }
+};
+
+#endif
+
 template<typename T, typename ST, typename SQT>
 static int sumsqr_(const T* src0, const uchar* mask, ST* sum, SQT* sqsum, int len, int cn )
 {
@@ -601,14 +939,15 @@ static int sumsqr_(const T* src0, const uchar* mask, ST* sum, SQT* sqsum, int le
 
     if( !mask )
     {
-        int i;
-        int k = cn % 4;
+        SumSqr_SIMD<T, ST, SQT> vop;
+        int i = vop(src0, mask, sum, sqsum, len, cn), k = cn % 4;
+        src += i * cn;
 
         if( k == 1 )
         {
             ST s0 = sum[0];
             SQT sq0 = sqsum[0];
-            for( i = 0; i < len; i++, src += cn )
+            for( ; i < len; i++, src += cn )
             {
                 T v = src[0];
                 s0 += v; sq0 += (SQT)v*v;
@@ -620,7 +959,7 @@ static int sumsqr_(const T* src0, const uchar* mask, ST* sum, SQT* sqsum, int le
         {
             ST s0 = sum[0], s1 = sum[1];
             SQT sq0 = sqsum[0], sq1 = sqsum[1];
-            for( i = 0; i < len; i++, src += cn )
+            for( ; i < len; i++, src += cn )
             {
                 T v0 = src[0], v1 = src[1];
                 s0 += v0; sq0 += (SQT)v0*v0;
@@ -633,7 +972,7 @@ static int sumsqr_(const T* src0, const uchar* mask, ST* sum, SQT* sqsum, int le
         {
             ST s0 = sum[0], s1 = sum[1], s2 = sum[2];
             SQT sq0 = sqsum[0], sq1 = sqsum[1], sq2 = sqsum[2];
-            for( i = 0; i < len; i++, src += cn )
+            for( ; i < len; i++, src += cn )
             {
                 T v0 = src[0], v1 = src[1], v2 = src[2];
                 s0 += v0; sq0 += (SQT)v0*v0;
@@ -649,7 +988,7 @@ static int sumsqr_(const T* src0, const uchar* mask, ST* sum, SQT* sqsum, int le
             src = src0 + k;
             ST s0 = sum[k], s1 = sum[k+1], s2 = sum[k+2], s3 = sum[k+3];
             SQT sq0 = sqsum[k], sq1 = sqsum[k+1], sq2 = sqsum[k+2], sq3 = sqsum[k+3];
-            for( i = 0; i < len; i++, src += cn )
+            for( ; i < len; i++, src += cn )
             {
                 T v0, v1;
                 v0 = src[0], v1 = src[1];
@@ -924,7 +1263,6 @@ cv::Scalar cv::sum( InputArray _src )
         }
     }
 #endif
-
     SumFunc func = getSumFunc(depth);
 
     CV_Assert( cn <= 4 && func != 0 );
@@ -1776,6 +2114,12 @@ static bool ocl_minMaxIdx( InputArray _src, double* minVal, double* maxVal, int*
                            int ddepth = -1, bool absValues = false, InputArray _src2 = noArray(), double * maxVal2 = NULL)
 {
     const ocl::Device & dev = ocl::Device::getDefault();
+
+#ifdef ANDROID
+    if (dev.isNVidia())
+        return false;
+#endif
+
     bool doubleSupport = dev.doubleFPConfig() > 0, haveMask = !_mask.empty(),
         haveSrc2 = _src2.kind() != _InputArray::NONE;
     int type = _src.type(), depth = CV_MAT_DEPTH(type), cn = CV_MAT_CN(type),
@@ -1976,7 +2320,10 @@ void cv::minMaxIdx(InputArray _src, double* minVal,
                     depth == CV_8U ? (ippiMinMaxIndxFuncC1)ippiMinMaxIndx_8u_C1R :
                     depth == CV_8S ? (ippiMinMaxIndxFuncC1)ippiMinMaxIndx_8s_C1R :
                     depth == CV_16U ? (ippiMinMaxIndxFuncC1)ippiMinMaxIndx_16u_C1R :
-                    depth == CV_32F ? (ippiMinMaxIndxFuncC1)ippiMinMaxIndx_32f_C1R : 0;
+                #if !((defined _MSC_VER && defined _M_IX86) || defined __i386__)
+                    depth == CV_32F ? (ippiMinMaxIndxFuncC1)ippiMinMaxIndx_32f_C1R :
+                #endif
+                    0;
                 CV_SUPPRESS_DEPRECATED_END
 
                 if( ippFuncC1 )
@@ -2069,274 +2416,6 @@ void cv::minMaxLoc( InputArray _img, double* minVal, double* maxVal,
 namespace cv
 {
 
-float normL2Sqr_(const float* a, const float* b, int n)
-{
-    int j = 0; float d = 0.f;
-#if CV_SSE
-    if( USE_SSE2 )
-    {
-        float CV_DECL_ALIGNED(16) buf[4];
-        __m128 d0 = _mm_setzero_ps(), d1 = _mm_setzero_ps();
-
-        for( ; j <= n - 8; j += 8 )
-        {
-            __m128 t0 = _mm_sub_ps(_mm_loadu_ps(a + j), _mm_loadu_ps(b + j));
-            __m128 t1 = _mm_sub_ps(_mm_loadu_ps(a + j + 4), _mm_loadu_ps(b + j + 4));
-            d0 = _mm_add_ps(d0, _mm_mul_ps(t0, t0));
-            d1 = _mm_add_ps(d1, _mm_mul_ps(t1, t1));
-        }
-        _mm_store_ps(buf, _mm_add_ps(d0, d1));
-        d = buf[0] + buf[1] + buf[2] + buf[3];
-    }
-    else
-#endif
-    {
-        for( ; j <= n - 4; j += 4 )
-        {
-            float t0 = a[j] - b[j], t1 = a[j+1] - b[j+1], t2 = a[j+2] - b[j+2], t3 = a[j+3] - b[j+3];
-            d += t0*t0 + t1*t1 + t2*t2 + t3*t3;
-        }
-    }
-
-    for( ; j < n; j++ )
-    {
-        float t = a[j] - b[j];
-        d += t*t;
-    }
-    return d;
-}
-
-
-float normL1_(const float* a, const float* b, int n)
-{
-    int j = 0; float d = 0.f;
-#if CV_SSE
-    if( USE_SSE2 )
-    {
-        float CV_DECL_ALIGNED(16) buf[4];
-        static const int CV_DECL_ALIGNED(16) absbuf[4] = {0x7fffffff, 0x7fffffff, 0x7fffffff, 0x7fffffff};
-        __m128 d0 = _mm_setzero_ps(), d1 = _mm_setzero_ps();
-        __m128 absmask = _mm_load_ps((const float*)absbuf);
-
-        for( ; j <= n - 8; j += 8 )
-        {
-            __m128 t0 = _mm_sub_ps(_mm_loadu_ps(a + j), _mm_loadu_ps(b + j));
-            __m128 t1 = _mm_sub_ps(_mm_loadu_ps(a + j + 4), _mm_loadu_ps(b + j + 4));
-            d0 = _mm_add_ps(d0, _mm_and_ps(t0, absmask));
-            d1 = _mm_add_ps(d1, _mm_and_ps(t1, absmask));
-        }
-        _mm_store_ps(buf, _mm_add_ps(d0, d1));
-        d = buf[0] + buf[1] + buf[2] + buf[3];
-    }
-    else
-#elif CV_NEON
-    float32x4_t v_sum = vdupq_n_f32(0.0f);
-    for ( ; j <= n - 4; j += 4)
-        v_sum = vaddq_f32(v_sum, vabdq_f32(vld1q_f32(a + j), vld1q_f32(b + j)));
-
-    float CV_DECL_ALIGNED(16) buf[4];
-    vst1q_f32(buf, v_sum);
-    d = buf[0] + buf[1] + buf[2] + buf[3];
-#endif
-    {
-        for( ; j <= n - 4; j += 4 )
-        {
-            d += std::abs(a[j] - b[j]) + std::abs(a[j+1] - b[j+1]) +
-                    std::abs(a[j+2] - b[j+2]) + std::abs(a[j+3] - b[j+3]);
-        }
-    }
-
-    for( ; j < n; j++ )
-        d += std::abs(a[j] - b[j]);
-    return d;
-}
-
-int normL1_(const uchar* a, const uchar* b, int n)
-{
-    int j = 0, d = 0;
-#if CV_SSE
-    if( USE_SSE2 )
-    {
-        __m128i d0 = _mm_setzero_si128();
-
-        for( ; j <= n - 16; j += 16 )
-        {
-            __m128i t0 = _mm_loadu_si128((const __m128i*)(a + j));
-            __m128i t1 = _mm_loadu_si128((const __m128i*)(b + j));
-
-            d0 = _mm_add_epi32(d0, _mm_sad_epu8(t0, t1));
-        }
-
-        for( ; j <= n - 4; j += 4 )
-        {
-            __m128i t0 = _mm_cvtsi32_si128(*(const int*)(a + j));
-            __m128i t1 = _mm_cvtsi32_si128(*(const int*)(b + j));
-
-            d0 = _mm_add_epi32(d0, _mm_sad_epu8(t0, t1));
-        }
-        d = _mm_cvtsi128_si32(_mm_add_epi32(d0, _mm_unpackhi_epi64(d0, d0)));
-    }
-    else
-#elif CV_NEON
-    uint32x4_t v_sum = vdupq_n_u32(0.0f);
-    for ( ; j <= n - 16; j += 16)
-    {
-        uint8x16_t v_dst = vabdq_u8(vld1q_u8(a + j), vld1q_u8(b + j));
-        uint16x8_t v_low = vmovl_u8(vget_low_u8(v_dst)), v_high = vmovl_u8(vget_high_u8(v_dst));
-        v_sum = vaddq_u32(v_sum, vaddl_u16(vget_low_u16(v_low), vget_low_u16(v_high)));
-        v_sum = vaddq_u32(v_sum, vaddl_u16(vget_high_u16(v_low), vget_high_u16(v_high)));
-    }
-
-    uint CV_DECL_ALIGNED(16) buf[4];
-    vst1q_u32(buf, v_sum);
-    d = buf[0] + buf[1] + buf[2] + buf[3];
-#endif
-    {
-        for( ; j <= n - 4; j += 4 )
-        {
-            d += std::abs(a[j] - b[j]) + std::abs(a[j+1] - b[j+1]) +
-                    std::abs(a[j+2] - b[j+2]) + std::abs(a[j+3] - b[j+3]);
-        }
-    }
-    for( ; j < n; j++ )
-        d += std::abs(a[j] - b[j]);
-    return d;
-}
-
-static const uchar popCountTable[] =
-{
-    0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4, 1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 5,
-    1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 5, 2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6,
-    1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 5, 2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6,
-    2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6, 3, 4, 4, 5, 4, 5, 5, 6, 4, 5, 5, 6, 5, 6, 6, 7,
-    1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 5, 2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6,
-    2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6, 3, 4, 4, 5, 4, 5, 5, 6, 4, 5, 5, 6, 5, 6, 6, 7,
-    2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6, 3, 4, 4, 5, 4, 5, 5, 6, 4, 5, 5, 6, 5, 6, 6, 7,
-    3, 4, 4, 5, 4, 5, 5, 6, 4, 5, 5, 6, 5, 6, 6, 7, 4, 5, 5, 6, 5, 6, 6, 7, 5, 6, 6, 7, 6, 7, 7, 8
-};
-
-static const uchar popCountTable2[] =
-{
-    0, 1, 1, 1, 1, 2, 2, 2, 1, 2, 2, 2, 1, 2, 2, 2, 1, 2, 2, 2, 2, 3, 3, 3, 2, 3, 3, 3, 2, 3, 3, 3,
-    1, 2, 2, 2, 2, 3, 3, 3, 2, 3, 3, 3, 2, 3, 3, 3, 1, 2, 2, 2, 2, 3, 3, 3, 2, 3, 3, 3, 2, 3, 3, 3,
-    1, 2, 2, 2, 2, 3, 3, 3, 2, 3, 3, 3, 2, 3, 3, 3, 2, 3, 3, 3, 3, 4, 4, 4, 3, 4, 4, 4, 3, 4, 4, 4,
-    2, 3, 3, 3, 3, 4, 4, 4, 3, 4, 4, 4, 3, 4, 4, 4, 2, 3, 3, 3, 3, 4, 4, 4, 3, 4, 4, 4, 3, 4, 4, 4,
-    1, 2, 2, 2, 2, 3, 3, 3, 2, 3, 3, 3, 2, 3, 3, 3, 2, 3, 3, 3, 3, 4, 4, 4, 3, 4, 4, 4, 3, 4, 4, 4,
-    2, 3, 3, 3, 3, 4, 4, 4, 3, 4, 4, 4, 3, 4, 4, 4, 2, 3, 3, 3, 3, 4, 4, 4, 3, 4, 4, 4, 3, 4, 4, 4,
-    1, 2, 2, 2, 2, 3, 3, 3, 2, 3, 3, 3, 2, 3, 3, 3, 2, 3, 3, 3, 3, 4, 4, 4, 3, 4, 4, 4, 3, 4, 4, 4,
-    2, 3, 3, 3, 3, 4, 4, 4, 3, 4, 4, 4, 3, 4, 4, 4, 2, 3, 3, 3, 3, 4, 4, 4, 3, 4, 4, 4, 3, 4, 4, 4
-};
-
-static const uchar popCountTable4[] =
-{
-    0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
-    1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
-    1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
-    1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
-    1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
-    1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
-    1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
-    1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2
-};
-
-static int normHamming(const uchar* a, int n)
-{
-    int i = 0, result = 0;
-#if CV_NEON
-    {
-        uint32x4_t bits = vmovq_n_u32(0);
-        for (; i <= n - 16; i += 16) {
-            uint8x16_t A_vec = vld1q_u8 (a + i);
-            uint8x16_t bitsSet = vcntq_u8 (A_vec);
-            uint16x8_t bitSet8 = vpaddlq_u8 (bitsSet);
-            uint32x4_t bitSet4 = vpaddlq_u16 (bitSet8);
-            bits = vaddq_u32(bits, bitSet4);
-        }
-        uint64x2_t bitSet2 = vpaddlq_u32 (bits);
-        result = vgetq_lane_s32 (vreinterpretq_s32_u64(bitSet2),0);
-        result += vgetq_lane_s32 (vreinterpretq_s32_u64(bitSet2),2);
-    }
-#endif
-        for( ; i <= n - 4; i += 4 )
-            result += popCountTable[a[i]] + popCountTable[a[i+1]] +
-            popCountTable[a[i+2]] + popCountTable[a[i+3]];
-    for( ; i < n; i++ )
-        result += popCountTable[a[i]];
-    return result;
-}
-
-int normHamming(const uchar* a, const uchar* b, int n)
-{
-    int i = 0, result = 0;
-#if CV_NEON
-    {
-        uint32x4_t bits = vmovq_n_u32(0);
-        for (; i <= n - 16; i += 16) {
-            uint8x16_t A_vec = vld1q_u8 (a + i);
-            uint8x16_t B_vec = vld1q_u8 (b + i);
-            uint8x16_t AxorB = veorq_u8 (A_vec, B_vec);
-            uint8x16_t bitsSet = vcntq_u8 (AxorB);
-            uint16x8_t bitSet8 = vpaddlq_u8 (bitsSet);
-            uint32x4_t bitSet4 = vpaddlq_u16 (bitSet8);
-            bits = vaddq_u32(bits, bitSet4);
-        }
-        uint64x2_t bitSet2 = vpaddlq_u32 (bits);
-        result = vgetq_lane_s32 (vreinterpretq_s32_u64(bitSet2),0);
-        result += vgetq_lane_s32 (vreinterpretq_s32_u64(bitSet2),2);
-    }
-#endif
-        for( ; i <= n - 4; i += 4 )
-            result += popCountTable[a[i] ^ b[i]] + popCountTable[a[i+1] ^ b[i+1]] +
-                    popCountTable[a[i+2] ^ b[i+2]] + popCountTable[a[i+3] ^ b[i+3]];
-    for( ; i < n; i++ )
-        result += popCountTable[a[i] ^ b[i]];
-    return result;
-}
-
-static int normHamming(const uchar* a, int n, int cellSize)
-{
-    if( cellSize == 1 )
-        return normHamming(a, n);
-    const uchar* tab = 0;
-    if( cellSize == 2 )
-        tab = popCountTable2;
-    else if( cellSize == 4 )
-        tab = popCountTable4;
-    else
-        CV_Error( CV_StsBadSize, "bad cell size (not 1, 2 or 4) in normHamming" );
-    int i = 0, result = 0;
-#if CV_ENABLE_UNROLLED
-    for( ; i <= n - 4; i += 4 )
-        result += tab[a[i]] + tab[a[i+1]] + tab[a[i+2]] + tab[a[i+3]];
-#endif
-    for( ; i < n; i++ )
-        result += tab[a[i]];
-    return result;
-}
-
-int normHamming(const uchar* a, const uchar* b, int n, int cellSize)
-{
-    if( cellSize == 1 )
-        return normHamming(a, b, n);
-    const uchar* tab = 0;
-    if( cellSize == 2 )
-        tab = popCountTable2;
-    else if( cellSize == 4 )
-        tab = popCountTable4;
-    else
-        CV_Error( CV_StsBadSize, "bad cell size (not 1, 2 or 4) in normHamming" );
-    int i = 0, result = 0;
-    #if CV_ENABLE_UNROLLED
-    for( ; i <= n - 4; i += 4 )
-        result += tab[a[i] ^ b[i]] + tab[a[i+1] ^ b[i+1]] +
-                tab[a[i+2] ^ b[i+2]] + tab[a[i+3] ^ b[i+3]];
-    #endif
-    for( ; i < n; i++ )
-        result += tab[a[i] ^ b[i]];
-    return result;
-}
-
-
 template<typename T, typename ST> int
 normInf_(const T* src, const uchar* mask, ST* _result, int len, int cn)
 {
@@ -2351,7 +2430,7 @@ normInf_(const T* src, const uchar* mask, ST* _result, int len, int cn)
             if( mask[i] )
             {
                 for( int k = 0; k < cn; k++ )
-                    result = std::max(result, ST(std::abs(src[k])));
+                    result = std::max(result, ST(cv_abs(src[k])));
             }
     }
     *_result = result;
@@ -2372,7 +2451,7 @@ normL1_(const T* src, const uchar* mask, ST* _result, int len, int cn)
             if( mask[i] )
             {
                 for( int k = 0; k < cn; k++ )
-                    result += std::abs(src[k]);
+                    result += cv_abs(src[k]);
             }
     }
     *_result = result;
@@ -2469,6 +2548,10 @@ normDiffL2_(const T* src1, const T* src2, const uchar* mask, ST* _result, int le
     return 0;
 }
 
+Hamming::ResultType Hamming::operator()( const unsigned char* a, const unsigned char* b, int size ) const
+{
+    return cv::hal::normHamming(a, b, size);
+}
 
 #define CV_DEF_NORM_FUNC(L, suffix, type, ntype) \
     static int norm##L##_##suffix(const type* src, const uchar* mask, ntype* r, int len, int cn) \
@@ -2547,6 +2630,12 @@ static NormDiffFunc getNormDiffFunc(int normType, int depth)
 static bool ocl_norm( InputArray _src, int normType, InputArray _mask, double & result )
 {
     const ocl::Device & d = ocl::Device::getDefault();
+
+#ifdef ANDROID
+    if (d.isNVidia())
+        return false;
+#endif
+
     int type = _src.type(), depth = CV_MAT_DEPTH(type), cn = CV_MAT_CN(type);
     bool doubleSupport = d.doubleFPConfig() > 0,
             haveMask = _mask.kind() != _InputArray::NONE;
@@ -2811,10 +2900,14 @@ double cv::norm( InputArray _src, int normType, InputArray _mask )
                 const uchar* data = src.ptr<uchar>();
 
                 if( normType == NORM_HAMMING )
-                    return normHamming(data, (int)len);
+                {
+                    return hal::normHamming(data, (int)len);
+                }
 
                 if( normType == NORM_HAMMING2 )
-                    return normHamming(data, (int)len, 2);
+                {
+                    return hal::normHamming(data, (int)len, 2);
+                }
             }
         }
     }
@@ -2838,7 +2931,9 @@ double cv::norm( InputArray _src, int normType, InputArray _mask )
         int result = 0;
 
         for( size_t i = 0; i < it.nplanes; i++, ++it )
-            result += normHamming(ptrs[0], total, cellSize);
+        {
+            result += hal::normHamming(ptrs[0], total, cellSize);
+        }
 
         return result;
     }
@@ -2912,6 +3007,11 @@ namespace cv {
 
 static bool ocl_norm( InputArray _src1, InputArray _src2, int normType, InputArray _mask, double & result )
 {
+#ifdef ANDROID
+    if (ocl::Device::getDefault().isNVidia())
+        return false;
+#endif
+
     Scalar sc1, sc2;
     int type = _src1.type(), depth = CV_MAT_DEPTH(type), cn = CV_MAT_CN(type);
     bool relative = (normType & NORM_RELATIVE) != 0;
@@ -3315,7 +3415,9 @@ double cv::norm( InputArray _src1, InputArray _src2, int normType, InputArray _m
         int result = 0;
 
         for( size_t i = 0; i < it.nplanes; i++, ++it )
-            result += normHamming(ptrs[0], ptrs[1], total, cellSize);
+        {
+            result += hal::normHamming(ptrs[0], ptrs[1], total, cellSize);
+        }
 
         return result;
     }
@@ -3452,13 +3554,18 @@ static void batchDistHamming(const uchar* src1, const uchar* src2, size_t step2,
     if( !mask )
     {
         for( int i = 0; i < nvecs; i++ )
-            dist[i] = normHamming(src1, src2 + step2*i, len);
+             dist[i] = hal::normHamming(src1, src2 + step2*i, len);
     }
     else
     {
         int val0 = INT_MAX;
         for( int i = 0; i < nvecs; i++ )
-            dist[i] = mask[i] ? normHamming(src1, src2 + step2*i, len) : val0;
+        {
+            if (mask[i])
+                dist[i] = hal::normHamming(src1, src2 + step2*i, len);
+            else
+                dist[i] = val0;
+        }
     }
 }
 
@@ -3469,13 +3576,18 @@ static void batchDistHamming2(const uchar* src1, const uchar* src2, size_t step2
     if( !mask )
     {
         for( int i = 0; i < nvecs; i++ )
-            dist[i] = normHamming(src1, src2 + step2*i, len, 2);
+            dist[i] = hal::normHamming(src1, src2 + step2*i, len, 2);
     }
     else
     {
         int val0 = INT_MAX;
         for( int i = 0; i < nvecs; i++ )
-            dist[i] = mask[i] ? normHamming(src1, src2 + step2*i, len, 2) : val0;
+        {
+            if (mask[i])
+                dist[i] = hal::normHamming(src1, src2 + step2*i, len, 2);
+            else
+                dist[i] = val0;
+        }
     }
 }
 
@@ -3714,6 +3826,11 @@ void cv::findNonZero( InputArray _src, OutputArray _idx )
     Mat src = _src.getMat();
     CV_Assert( src.type() == CV_8UC1 );
     int n = countNonZero(src);
+    if( n == 0 )
+    {
+        _idx.release();
+        return;
+    }
     if( _idx.kind() == _InputArray::MAT && !_idx.getMatRef().isContinuous() )
         _idx.release();
     _idx.create(n, 1, CV_32SC2);

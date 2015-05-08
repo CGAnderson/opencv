@@ -45,6 +45,88 @@
 using namespace cv;
 using namespace std;
 
+static
+bool mats_equal(const Mat& lhs, const Mat& rhs)
+{
+    if (lhs.channels() != rhs.channels() ||
+        lhs.depth() != rhs.depth() ||
+        lhs.size().height != rhs.size().height ||
+        lhs.size().width != rhs.size().width)
+    {
+        return false;
+    }
+
+    Mat diff = (lhs != rhs);
+    const Scalar s = sum(diff);
+    for (int i = 0; i < s.channels; ++i)
+    {
+        if (s[i] != 0)
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static
+bool imread_compare(const string& filepath, int flags = IMREAD_COLOR)
+{
+    vector<Mat> pages;
+    if (!imreadmulti(filepath, pages, flags) ||
+        pages.empty())
+    {
+        return false;
+    }
+
+    const Mat single = imread(filepath, flags);
+    return mats_equal(single, pages[0]);
+}
+
+TEST(Imgcodecs_imread, regression)
+{
+    const char* const filenames[] =
+    {
+#ifdef HAVE_JASPER
+        "Rome.jp2",
+#endif
+        "color_palette_alpha.png",
+        "multipage.tif",
+        "rle.hdr",
+        "ordinary.bmp",
+        "rle8.bmp",
+        "test_1_c1.jpg"
+    };
+
+    const string folder = string(cvtest::TS::ptr()->get_data_path()) + "/readwrite/";
+
+    for (size_t i = 0; i < sizeof(filenames) / sizeof(filenames[0]); ++i)
+    {
+        const string path = folder + string(filenames[i]);
+        ASSERT_TRUE(imread_compare(path, IMREAD_UNCHANGED));
+        ASSERT_TRUE(imread_compare(path, IMREAD_GRAYSCALE));
+        ASSERT_TRUE(imread_compare(path, IMREAD_COLOR));
+        ASSERT_TRUE(imread_compare(path, IMREAD_ANYDEPTH));
+        ASSERT_TRUE(imread_compare(path, IMREAD_ANYCOLOR));
+        if (path.substr(path.length() - 3) != "hdr")
+        {
+            // GDAL does not support hdr
+            ASSERT_TRUE(imread_compare(path, IMREAD_LOAD_GDAL));
+        }
+    }
+}
+
+#ifdef HAVE_JASPER
+TEST(Imgcodecs_jasper, regression)
+{
+    const string folder = string(cvtest::TS::ptr()->get_data_path()) + "/readwrite/";
+
+    ASSERT_TRUE(imread_compare(folder + "Bretagne2.jp2", IMREAD_COLOR));
+    ASSERT_TRUE(imread_compare(folder + "Bretagne2.jp2", IMREAD_GRAYSCALE));
+    ASSERT_TRUE(imread_compare(folder + "Grey.jp2", IMREAD_COLOR));
+    ASSERT_TRUE(imread_compare(folder + "Grey.jp2", IMREAD_GRAYSCALE));
+}
+#endif
 
 class CV_GrfmtWriteBigImageTest : public cvtest::BaseTest
 {
@@ -589,6 +671,46 @@ public:
 TEST(Imgcodecs_Tiff, decode_tile_remainder)
 {
     CV_GrfmtReadTifTiledWithNotFullTiles test; test.safe_run();
+}
+
+class CV_GrfmtReadTifMultiPage : public cvtest::BaseTest
+{
+private:
+    void compare(int flags)
+    {
+        const string folder = string(cvtest::TS::ptr()->get_data_path()) + "/readwrite/";
+        const int page_count = 6;
+
+        vector<Mat> pages;
+        bool res = imreadmulti(folder + "multipage.tif", pages, flags);
+        ASSERT_TRUE(res == true);
+        ASSERT_EQ(static_cast<size_t>(page_count), pages.size());
+
+        for (int i = 0; i < page_count; i++)
+        {
+            char buffer[256];
+            sprintf(buffer, "%smultipage_p%d.tif", folder.c_str(), i + 1);
+            const string filepath(buffer);
+            const Mat page = imread(filepath, flags);
+            ASSERT_TRUE(mats_equal(page, pages[i]));
+        }
+    }
+
+public:
+    void run(int)
+    {
+        compare(IMREAD_UNCHANGED);
+        compare(IMREAD_GRAYSCALE);
+        compare(IMREAD_COLOR);
+        compare(IMREAD_ANYDEPTH);
+        compare(IMREAD_ANYCOLOR);
+        // compare(IMREAD_LOAD_GDAL); // GDAL does not support multi-page TIFFs
+    }
+};
+
+TEST(Imgcodecs_Tiff, decode_multipage)
+{
+    CV_GrfmtReadTifMultiPage test; test.safe_run();
 }
 
 #endif
