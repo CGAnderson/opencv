@@ -1675,6 +1675,7 @@ public:
         Mat samples = data->getTrainSamples();
         Mat responses;
         bool is_classification = false;
+        Mat class_labels0;
         int class_count = (int)class_labels.total();
 
         if( svmType == C_SVC || svmType == NU_SVC )
@@ -1688,7 +1689,8 @@ public:
             setRangeVector(temp_class_labels, class_count);
 
             // temporarily replace class labels with 0, 1, ..., NCLASSES-1
-            Mat(temp_class_labels).copyTo(class_labels);
+            class_labels0 = class_labels;
+            class_labels = Mat(temp_class_labels).clone();
         }
         else
             responses = data->getTrainResponses();
@@ -1793,10 +1795,10 @@ public:
                 if( !do_train( temp_train_samples, temp_train_responses ))
                     continue;
 
-                for( i = 0; i < train_sample_count; i++ )
+                for( i = 0; i < test_sample_count; i++ )
                 {
                     j = sidx[(i+start+train_sample_count) % sample_count];
-                    memcpy(temp_train_samples.ptr(i), samples.ptr(j), sample_size);
+                    memcpy(temp_test_samples.ptr(i), samples.ptr(j), sample_size);
                 }
 
                 predict(temp_test_samples, temp_test_responses, 0);
@@ -1821,6 +1823,7 @@ public:
         }
 
         params = best_params;
+        class_labels = class_labels0;
         return do_train( samples, responses );
     }
 

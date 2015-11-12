@@ -902,7 +902,7 @@ static bool ocl_split( InputArray _m, OutputArrayOfArrays _mv )
         argidx = k.set(argidx, ocl::KernelArg::WriteOnlyNoSize(dst[i]));
     k.set(argidx, rowsPerWI);
 
-    size_t globalsize[2] = { size.width, (size.height + rowsPerWI - 1) / rowsPerWI };
+    size_t globalsize[2] = { (size_t)size.width, ((size_t)size.height + rowsPerWI - 1) / rowsPerWI };
     return k.run(2, globalsize, NULL, false);
 }
 
@@ -1069,7 +1069,7 @@ static bool ocl_merge( InputArrayOfArrays _mv, OutputArray _dst )
     argidx = k.set(argidx, ocl::KernelArg::WriteOnly(dst));
     k.set(argidx, rowsPerWI);
 
-    size_t globalsize[2] = { dst.cols, (dst.rows + rowsPerWI - 1) / rowsPerWI };
+    size_t globalsize[2] = { (size_t)dst.cols, ((size_t)dst.rows + rowsPerWI - 1) / rowsPerWI };
     return k.run(2, globalsize, NULL, false);
 }
 
@@ -1338,7 +1338,7 @@ static bool ocl_mixChannels(InputArrayOfArrays _src, InputOutputArrayOfArrays _d
     argindex = k.set(argindex, size.width);
     k.set(argindex, rowsPerWI);
 
-    size_t globalsize[2] = { size.width, (size.height + rowsPerWI - 1) / rowsPerWI };
+    size_t globalsize[2] = { (size_t)size.width, ((size_t)size.height + rowsPerWI - 1) / rowsPerWI };
     return k.run(2, globalsize, NULL, false);
 }
 
@@ -5194,18 +5194,7 @@ dtype* dst, size_t dstep, Size size, double* scale) \
 static void cvt##suffix( const stype* src, size_t sstep, const uchar*, size_t, \
                          dtype* dst, size_t dstep, Size size, double*) \
 { \
-    CV_IPP_CHECK()\
-    {\
-        if (src && dst)\
-        {\
-            if (ippiConvert_##ippFavor(src, (int)sstep, dst, (int)dstep, ippiSize(size.width, size.height)) >= 0) \
-            {\
-                CV_IMPL_ADD(CV_IMPL_IPP)\
-                return; \
-            }\
-            setIppErrorStatus(); \
-        }\
-    }\
+    CV_IPP_RUN(src && dst, ippiConvert_##ippFavor(src, (int)sstep, dst, (int)dstep, ippiSize(size.width, size.height)) >= 0)\
     cvt_(src, sstep, dst, dstep, size); \
 }
 
@@ -5213,18 +5202,7 @@ static void cvt##suffix( const stype* src, size_t sstep, const uchar*, size_t, \
 static void cvt##suffix( const stype* src, size_t sstep, const uchar*, size_t, \
                          dtype* dst, size_t dstep, Size size, double*) \
 { \
-    CV_IPP_CHECK()\
-    {\
-        if (src && dst)\
-        {\
-            if (ippiConvert_##ippFavor(src, (int)sstep, dst, (int)dstep, ippiSize(size.width, size.height), ippRndFinancial, 0) >= 0) \
-            {\
-                CV_IMPL_ADD(CV_IMPL_IPP)\
-                return; \
-            }\
-            setIppErrorStatus(); \
-        }\
-    }\
+    CV_IPP_RUN(src && dst, ippiConvert_##ippFavor(src, (int)sstep, dst, (int)dstep, ippiSize(size.width, size.height), ippRndFinancial, 0) >= 0)\
     cvt_(src, sstep, dst, dstep, size); \
 }
 #else
@@ -5527,7 +5505,7 @@ static bool ocl_convertScaleAbs( InputArray _src, OutputArray _dst, double alpha
     else if (wdepth == CV_64F)
         k.args(srcarg, dstarg, alpha, beta);
 
-    size_t globalsize[2] = { src.cols * cn / kercn, (src.rows + rowsPerWI - 1) / rowsPerWI };
+    size_t globalsize[2] = { (size_t)src.cols * cn / kercn, ((size_t)src.rows + rowsPerWI - 1) / rowsPerWI };
     return k.run(2, globalsize, NULL, false);
 }
 
@@ -5695,7 +5673,7 @@ static bool ocl_LUT(InputArray _src, InputArray _lut, OutputArray _dst)
     k.args(ocl::KernelArg::ReadOnlyNoSize(src), ocl::KernelArg::ReadOnlyNoSize(lut),
         ocl::KernelArg::WriteOnly(dst, dcn, kercn));
 
-    size_t globalSize[2] = { dst.cols * dcn / kercn, (dst.rows + 3) / 4 };
+    size_t globalSize[2] = { (size_t)dst.cols * dcn / kercn, ((size_t)dst.rows + 3) / 4 };
     return k.run(2, globalSize, NULL, false);
 }
 
@@ -5704,7 +5682,7 @@ static bool ocl_LUT(InputArray _src, InputArray _lut, OutputArray _dst)
 #if defined(HAVE_IPP)
 namespace ipp {
 
-#if 0 // there are no performance benefits (PR #2653)
+#if IPP_DISABLE_BLOCK // there are no performance benefits (PR #2653)
 class IppLUTParallelBody_LUTC1 : public ParallelLoopBody
 {
 public:
@@ -5860,6 +5838,45 @@ private:
     IppLUTParallelBody_LUTCN& operator=(const IppLUTParallelBody_LUTCN&);
 };
 } // namespace ipp
+
+static bool ipp_lut(Mat &src, Mat &lut, Mat &dst)
+{
+    int lutcn = lut.channels();
+
+    if(src.dims > 2)
+        return false;
+
+    bool ok = false;
+    Ptr<ParallelLoopBody> body;
+
+    size_t elemSize1 = CV_ELEM_SIZE1(dst.depth());
+#if IPP_DISABLE_BLOCK // there are no performance benefits (PR #2653)
+    if (lutcn == 1)
+    {
+        ParallelLoopBody* p = new ipp::IppLUTParallelBody_LUTC1(src, lut, dst, &ok);
+        body.reset(p);
+    }
+    else
+#endif
+    if ((lutcn == 3 || lutcn == 4) && elemSize1 == 1)
+    {
+        ParallelLoopBody* p = new ipp::IppLUTParallelBody_LUTCN(src, lut, dst, &ok);
+        body.reset(p);
+    }
+
+    if (body != NULL && ok)
+    {
+        Range all(0, dst.rows);
+        if (dst.total()>>18)
+            parallel_for_(all, *body, (double)std::max((size_t)1, dst.total()>>16));
+        else
+            (*body)(all);
+        if (ok)
+            return true;
+    }
+
+    return false;
+}
 #endif // IPP
 
 class LUTParallelBody : public ParallelLoopBody
@@ -5923,29 +5940,13 @@ void cv::LUT( InputArray _src, InputArray _lut, OutputArray _dst )
     _dst.create(src.dims, src.size, CV_MAKETYPE(_lut.depth(), cn));
     Mat dst = _dst.getMat();
 
+    CV_IPP_RUN(_src.dims() <= 2, ipp_lut(src, lut, dst));
+
     if (_src.dims() <= 2)
     {
         bool ok = false;
         Ptr<ParallelLoopBody> body;
-#if defined(HAVE_IPP)
-        CV_IPP_CHECK()
-        {
-            size_t elemSize1 = CV_ELEM_SIZE1(dst.depth());
-#if 0 // there are no performance benefits (PR #2653)
-            if (lutcn == 1)
-            {
-                ParallelLoopBody* p = new ipp::IppLUTParallelBody_LUTC1(src, lut, dst, &ok);
-                body.reset(p);
-            }
-            else
-#endif
-            if ((lutcn == 3 || lutcn == 4) && elemSize1 == 1)
-            {
-                ParallelLoopBody* p = new ipp::IppLUTParallelBody_LUTCN(src, lut, dst, &ok);
-                body.reset(p);
-            }
-        }
-#endif
+
         if (body == NULL || ok == false)
         {
             ok = false;
@@ -6052,7 +6053,7 @@ static bool ocl_normalize( InputArray _src, InputOutputArray _dst, InputArray _m
                 k.args(srcarg, maskarg, dstarg);
         }
 
-        size_t globalsize[2] = { src.cols, (src.rows + rowsPerWI - 1) / rowsPerWI };
+        size_t globalsize[2] = { (size_t)src.cols, ((size_t)src.rows + rowsPerWI - 1) / rowsPerWI };
         return k.run(2, globalsize, NULL, false);
     }
     else
